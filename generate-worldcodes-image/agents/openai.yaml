@@ -1,0 +1,4 @@
+interface:
+  display_name: "WorldCodes Image 2"
+  short_description: "通过 WorldCodes 调用 gpt-image-2 生成和编辑图片"
+  default_prompt: "使用 $generate-worldcodes-image 根据我的提示词生成一张图片并保存到输出目录。"
