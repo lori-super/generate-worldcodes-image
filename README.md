@@ -9,7 +9,7 @@
 [![GPT Image 2](https://img.shields.io/badge/GPT--Image--2-10A37F?style=for-the-badge)](https://developers.openai.com/api/docs/models/gpt-image-2)
 [![1K–4K](https://img.shields.io/badge/Resolution-1K--4K-F97316?style=for-the-badge)](#尺寸)
 
-纯 Python 标准库 · 无第三方依赖 · Key 不落盘 · 同步输出本地图片
+纯 Python 标准库 · 无第三方依赖 · Key 不落盘 · 默认异步任务 · 保留同步模式
 
 </div>
 
@@ -40,6 +40,8 @@
 | 🔭 1K–4K | 内置横版、竖版、方形快捷尺寸，也支持合法自定义尺寸 |
 | 📦 多种格式 | 支持 PNG、JPEG、WebP 输出与 JPEG/WebP 压缩参数 |
 | 📦 批量生成 | `--count` 顺序发送多个独立的 `n=1` 请求，计费行为更清晰 |
+| ⏳ 异步任务 | 默认提交 Relay 任务并轮询结果，避免客户端长连接触发 524 |
+| 🔁 幂等恢复 | 为任务生成 `Idempotency-Key`，异常时可恢复原任务而不重复入队 |
 | 🛡️ 安全输出 | 拒绝远程 HTTP 和重定向，不回显 Key，并校验返回图片结构 |
 
 ## 环境要求
@@ -99,6 +101,7 @@ export WORLDCODES_API_KEY="YOUR_WORLDCODES_API_KEY"
 ```bash
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/generate-worldcodes-image/scripts/worldcodes_image.py" \
   --prompt "一只橙色纸飞机，纯白背景，摄影棚柔光" \
+  --mode async \
   --size 1k \
   --quality auto \
   --output /absolute/path/to/outputs/
@@ -110,8 +113,18 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/generate-worldcodes-image/scripts/wo
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/generate-worldcodes-image/scripts/worldcodes_image.py" \
   --image /absolute/path/to/input.png \
   --prompt "保留主体，把背景改成清澈蓝天" \
+  --mode async \
   --size 2k-landscape \
   --output /absolute/path/to/outputs/edited.png
+```
+
+保留原同步调用：
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/generate-worldcodes-image/scripts/worldcodes_image.py" \
+  --prompt "一张极简公园导览图" \
+  --mode sync \
+  --output /absolute/path/to/outputs/park.png
 ```
 
 先校验参数、不联网也不计费：
@@ -145,10 +158,16 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/generate-worldcodes-image/scripts/wo
 
 - Key 只从 `WORLDCODES_API_KEY` 读取，不作为命令行参数传递。
 - 默认请求 `response_format=b64_json`，只将解码后的图片写入本地。
-- 不自动重试超时或 5xx，避免不确定计费情况下重复请求。
-- 多张图片按顺序独立请求，成功结果和 request ID 都会写入结构化摘要。
+- 默认 `--mode async`：使用 `Prefer: respond-async` 提交任务，再查询状态与结果；Relay 上游仍同步执行。
+- `--mode sync` 保留原同步接口行为，便于兼容尚未部署任务接口的 Relay。
+- 不自动重复提交生图 POST；异步查询发生临时网络错误或 5xx 时只重试 GET。
+- 异步任务使用 `Idempotency-Key`。恢复时必须复用完全相同的参数和同一 Key；`unknown` 状态不得换 Key 自动重生。
+- 多张图片按顺序独立请求，任务 ID、应用 request ID 与 Cloudflare Ray ID 分别写入结构化摘要。
 - 参考图、蒙版和响应图片均做格式与结构校验。
 - 自定义远程 Base URL 必须使用 HTTPS；本机回环地址可使用 HTTP 测试。
+
+> [!WARNING]
+> HTTP 524 是代理等待源站响应超时，不是客户端 `--timeout` 太短，也不代表等待 120 秒后即可安全重试。优先使用异步模式；若任务状态为 `unknown`，先核对 Relay 日志和计费记录。
 
 ## 项目结构
 

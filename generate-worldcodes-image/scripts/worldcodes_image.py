@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 import zlib
 from datetime import datetime
 from typing import Any
@@ -26,6 +27,7 @@ DEFAULT_MODEL = "gpt-image-2"
 KEY_ENV = "WORLDCODES_API_KEY"
 BASE_URL_ENV = "WORLDCODES_BASE_URL"
 MODEL_ENV = "WORLDCODES_IMAGE_MODEL"
+MODE_ENV = "WORLDCODES_IMAGE_MODE"
 
 SIZE_PRESETS = {
     "1k": "1024x1024",
@@ -41,7 +43,9 @@ SIZE_PRESETS = {
     "4k-portrait": "2160x3840",
 }
 FORMAT_EXTENSIONS = {"png": ".png", "jpeg": ".jpg", "webp": ".webp"}
-REQUEST_ID_HEADERS = ("x-request-id", "x-oneapi-request-id", "cf-ray")
+APPLICATION_REQUEST_ID_HEADERS = ("x-oneapi-request-id", "x-request-id")
+CF_RAY_HEADER = "cf-ray"
+ASYNC_TASK_ID_PATTERN = re.compile(r"imgjob_[A-Za-z0-9]{32}")
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 IMAGE_SIGNATURES = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
@@ -53,11 +57,59 @@ class UserError(RuntimeError):
     """An error safe to show to the user."""
 
 
-class CompletedRequestError(UserError):
+class RequestError(UserError):
+    """A request failure with structured diagnostics safe to print."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: int | None = None,
+        request_id: str | None = None,
+        cf_ray: str | None = None,
+        task_id: str | None = None,
+        idempotency_key: str | None = None,
+        billing_state: str = "unknown",
+        resubmit_safe_with_same_idempotency_key: bool = False,
+        poll_safe: bool = False,
+    ):
+        super().__init__(message)
+        self.http_status = http_status
+        self.request_id = request_id
+        self.cf_ray = cf_ray
+        self.task_id = task_id
+        self.idempotency_key = idempotency_key
+        self.billing_state = billing_state
+        self.resubmit_safe_with_same_idempotency_key = (
+            resubmit_safe_with_same_idempotency_key
+        )
+        self.poll_safe = poll_safe
+
+
+class CompletedRequestError(RequestError):
     """A 2xx response failed while being read and may already be billed."""
 
-    def __init__(self, message: str, response_request_id: str | None):
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str,
+        response_request_id: str | None,
+        *,
+        cf_ray: str | None = None,
+        task_id: str | None = None,
+        idempotency_key: str | None = None,
+        resubmit_safe_with_same_idempotency_key: bool = False,
+    ):
+        super().__init__(
+            message,
+            request_id=response_request_id,
+            cf_ray=cf_ray,
+            task_id=task_id,
+            idempotency_key=idempotency_key,
+            billing_state="unknown",
+            resubmit_safe_with_same_idempotency_key=(
+                resubmit_safe_with_same_idempotency_key
+            ),
+        )
         self.response_request_id = response_request_id
 
 
@@ -122,7 +174,30 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get(MODEL_ENV, DEFAULT_MODEL),
         help=f"模型名；也可用 {MODEL_ENV}",
     )
+    parser.add_argument(
+        "--mode",
+        dest="request_mode",
+        choices=("async", "sync"),
+        default=os.environ.get(MODE_ENV, "async").strip().lower(),
+        help=f"请求模式；默认异步，也可用 {MODE_ENV}",
+    )
     parser.add_argument("--timeout", type=float, default=300.0, help="单次请求超时秒数")
+    parser.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=1800.0,
+        help="异步任务最长等待秒数；不改变 Relay 到上游的超时",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=2.0,
+        help="异步状态轮询默认间隔秒数；优先采用服务端 Retry-After",
+    )
+    parser.add_argument(
+        "--idempotency-key",
+        help="异步单请求幂等键；用于对同一请求进行安全恢复，1–128 位可见 ASCII",
+    )
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖已有输出文件")
     parser.add_argument(
         "--dry-run",
@@ -220,6 +295,24 @@ def validate_args(args: argparse.Namespace) -> tuple[str, str]:
         raise UserError("--count 必须在 1–10 之间")
     if args.timeout <= 0:
         raise UserError("--timeout 必须大于 0")
+    if args.wait_timeout <= 0:
+        raise UserError("--wait-timeout 必须大于 0")
+    if args.poll_interval <= 0:
+        raise UserError("--poll-interval 必须大于 0")
+    if args.request_mode not in {"async", "sync"}:
+        raise UserError(f"{MODE_ENV} 只能是 async 或 sync")
+    if args.idempotency_key is not None:
+        key_bytes = args.idempotency_key.encode("utf-8", errors="strict")
+        if (
+            not key_bytes
+            or len(key_bytes) > 128
+            or any(value < 0x21 or value > 0x7E for value in key_bytes)
+        ):
+            raise UserError("--idempotency-key 必须为 1–128 位可见 ASCII 字符")
+        if args.request_mode != "async":
+            raise UserError("--idempotency-key 仅用于 --mode async")
+        if args.count != 1:
+            raise UserError("手动指定 --idempotency-key 时 --count 必须为 1")
     if args.output_compression is not None:
         if not 0 <= args.output_compression <= 100:
             raise UserError("--output-compression 必须在 0–100 之间")
@@ -278,16 +371,142 @@ def build_multipart(
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
-def request_id(headers: Any) -> str | None:
-    for name in REQUEST_ID_HEADERS:
+def response_ids(headers: Any) -> tuple[str | None, str | None]:
+    if headers is None:
+        return None, None
+    for name in APPLICATION_REQUEST_ID_HEADERS:
         value = headers.get(name)
         if value:
-            return str(value)
-    return None
+            return str(value), str(headers.get(CF_RAY_HEADER) or "") or None
+    return None, str(headers.get(CF_RAY_HEADER) or "") or None
+
+
+def normalized_headers(headers: Any) -> dict[str, str]:
+    if headers is None:
+        return {}
+    return {str(name).lower(): str(value).strip() for name, value in headers.items()}
 
 
 def redact(text: str, key: str) -> str:
     return text.replace(key, "[REDACTED]") if key else text
+
+
+def api_request(
+    endpoint: str,
+    method: str,
+    api_key: str,
+    timeout: float,
+    *,
+    body: bytes | None = None,
+    content_type: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+    idempotency_key: str | None = None,
+    task_id: str | None = None,
+) -> tuple[bytes, int, str | None, str | None, dict[str, str]]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "User-Agent": "generate-worldcodes-image/2.0",
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    if extra_headers:
+        headers.update(extra_headers)
+    request = Request(
+        endpoint,
+        data=body,
+        method=method,
+        headers=headers,
+    )
+    try:
+        response = NO_REDIRECT_OPENER.open(request, timeout=timeout)
+    except HTTPError as exc:
+        response_request_id, cf_ray = response_ids(exc.headers)
+        try:
+            raw_error = exc.read(16_384).decode("utf-8", errors="replace")
+        except (HTTPException, OSError):
+            raw_error = "<错误响应体读取不完整>"
+        raw_error = redact(raw_error, api_key)
+        suffix = f"，request_id={response_request_id}" if response_request_id else ""
+        if cf_ray:
+            suffix += f"，cf_ray={cf_ray}"
+        timeout_note = ""
+        if exc.code == 524:
+            timeout_note = "；代理已连接源站但等待响应超时，调大客户端 --timeout 无法延长该层超时"
+        retryable_submit = bool(idempotency_key) and (
+            exc.code >= 500 or exc.code in {408, 425, 429}
+        )
+        retry_note = ""
+        if method == "POST":
+            retry_note = "；未自动重提"
+            if retryable_submit:
+                retry_note += "，仅可携带同一 Idempotency-Key 重放完全相同的请求"
+        raise RequestError(
+            f"WorldCodes HTTP {exc.code}{suffix}{timeout_note}{retry_note}：{raw_error}",
+            http_status=exc.code,
+            request_id=response_request_id,
+            cf_ray=cf_ray,
+            task_id=task_id,
+            idempotency_key=idempotency_key,
+            billing_state="unknown",
+            resubmit_safe_with_same_idempotency_key=retryable_submit,
+            poll_safe=(
+                method == "GET"
+                and (exc.code >= 500 or exc.code in {408, 409, 425, 429})
+            ),
+        ) from exc
+    except (URLError, TimeoutError) as exc:
+        retry_note = ""
+        if method == "POST":
+            retry_note = "；未自动重提"
+            if idempotency_key:
+                retry_note += "，仅可携带同一 Idempotency-Key 重放完全相同的请求"
+        raise RequestError(
+            f"WorldCodes 连接失败：{exc}{retry_note}",
+            task_id=task_id,
+            idempotency_key=idempotency_key,
+            billing_state="unknown",
+            resubmit_safe_with_same_idempotency_key=(
+                method == "POST" and bool(idempotency_key)
+            ),
+            poll_safe=(method == "GET"),
+        ) from exc
+    response_request_id, cf_ray = response_ids(response.headers)
+    response_headers = normalized_headers(response.headers)
+    response_status = int(getattr(response, "status", response.getcode()))
+    try:
+        with response:
+            raw = response.read()
+    except (HTTPException, OSError) as exc:
+        suffix = f"，request_id={response_request_id}" if response_request_id else ""
+        if cf_ray:
+            suffix += f"，cf_ray={cf_ray}"
+        if method == "POST":
+            preference_applied = (
+                response_headers.get("preference-applied", "").lower()
+                == "respond-async"
+            )
+            raise CompletedRequestError(
+                f"WorldCodes HTTP 2xx 响应读取中断{suffix}；未自动重提",
+                response_request_id,
+                cf_ray=cf_ray,
+                task_id=task_id,
+                idempotency_key=idempotency_key,
+                resubmit_safe_with_same_idempotency_key=(
+                    bool(idempotency_key)
+                    and response_status == 202
+                    and preference_applied
+                ),
+            ) from exc
+        raise RequestError(
+            f"WorldCodes GET 响应读取中断{suffix}",
+            request_id=response_request_id,
+            cf_ray=cf_ray,
+            task_id=task_id,
+            billing_state="unknown",
+            poll_safe=True,
+        ) from exc
+    return raw, response_status, response_request_id, cf_ray, response_headers
 
 
 def post_request(
@@ -296,63 +515,274 @@ def post_request(
     content_type: str,
     api_key: str,
     timeout: float,
-) -> tuple[bytes, str | None]:
-    request = Request(
+    *,
+    idempotency_key: str | None = None,
+) -> tuple[bytes, int, str | None, str | None, dict[str, str]]:
+    extra_headers: dict[str, str] = {}
+    if idempotency_key:
+        extra_headers = {
+            "Prefer": "respond-async",
+            "Idempotency-Key": idempotency_key,
+        }
+    return api_request(
         endpoint,
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": content_type,
-            "Accept": "application/json",
-            "User-Agent": "generate-worldcodes-image/1.0",
-        },
+        "POST",
+        api_key,
+        timeout,
+        body=body,
+        content_type=content_type,
+        extra_headers=extra_headers,
+        idempotency_key=idempotency_key,
     )
-    try:
-        response = NO_REDIRECT_OPENER.open(request, timeout=timeout)
-    except HTTPError as exc:
-        response_request_id = request_id(exc.headers)
-        try:
-            raw_error = exc.read(16_384).decode("utf-8", errors="replace")
-        except (HTTPException, OSError):
-            raw_error = "<错误响应体读取不完整>"
-        raw_error = redact(raw_error, api_key)
-        suffix = f"，request_id={response_request_id}" if response_request_id else ""
-        retry_note = "；未自动重试，请先确认是否已计费" if exc.code >= 500 else ""
-        raise UserError(
-            f"WorldCodes HTTP {exc.code}{suffix}{retry_note}：{raw_error}"
-        ) from exc
-    except (URLError, TimeoutError) as exc:
-        raise UserError(f"WorldCodes 连接失败：{exc}；未自动重试，请先确认是否已计费") from exc
-    response_request_id = request_id(response.headers)
-    try:
-        with response:
-            raw = response.read()
-    except (HTTPException, OSError) as exc:
-        suffix = f"，request_id={response_request_id}" if response_request_id else ""
-        raise CompletedRequestError(
-            f"WorldCodes HTTP 2xx 响应读取中断{suffix}；请勿盲目重试",
-            response_request_id,
-        ) from exc
-    return raw, response_request_id
 
 
-def parse_api_payload(
-    raw: bytes, api_key: str, response_request_id: str | None
+def get_request(
+    endpoint: str,
+    api_key: str,
+    timeout: float,
+    task_id: str,
+) -> tuple[bytes, int, str | None, str | None, dict[str, str]]:
+    return api_request(
+        endpoint,
+        "GET",
+        api_key,
+        timeout,
+        task_id=task_id,
+    )
+
+
+def parse_json_object(
+    raw: bytes,
+    api_key: str,
+    response_request_id: str | None,
+    *,
+    label: str = "API",
 ) -> dict[str, Any]:
     try:
         payload = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         snippet = redact(raw[:500].decode("utf-8", errors="replace"), api_key)
         suffix = f"，request_id={response_request_id}" if response_request_id else ""
-        raise UserError(f"API 返回的不是有效 JSON{suffix}：{snippet}") from exc
+        raise UserError(f"{label} 返回的不是有效 JSON{suffix}：{snippet}") from exc
     if not isinstance(payload, dict):
-        raise UserError("API JSON 响应不是对象")
+        raise UserError(f"{label} JSON 响应不是对象")
+    return payload
+
+
+def parse_api_payload(
+    raw: bytes, api_key: str, response_request_id: str | None
+) -> dict[str, Any]:
+    payload = parse_json_object(raw, api_key, response_request_id)
     if payload.get("error"):
         error_text = redact(json.dumps(payload["error"], ensure_ascii=False), api_key)
         suffix = f"，request_id={response_request_id}" if response_request_id else ""
         raise UserError(f"API 返回错误{suffix}：{error_text}")
     return payload
+
+
+def validate_async_task_payload(payload: dict[str, Any]) -> str:
+    task_id = payload.get("id")
+    if not isinstance(task_id, str) or not ASYNC_TASK_ID_PATTERN.fullmatch(task_id):
+        raise UserError("异步提交响应缺少合法的图片任务 ID")
+    if payload.get("object") != "image.task":
+        raise UserError("异步提交响应 object 不是 image.task")
+    return task_id
+
+
+def task_request_id(payload: dict[str, Any]) -> str | None:
+    value = payload.get("request_id")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def poll_delay(headers: dict[str, str], default: float) -> float:
+    raw = headers.get("retry-after", "")
+    try:
+        value = float(raw)
+    except ValueError:
+        value = default
+    return min(max(value, 0.1), 10.0)
+
+
+def submit_async_request(
+    endpoint: str,
+    body: bytes,
+    content_type: str,
+    api_key: str,
+    timeout: float,
+    idempotency_key: str,
+) -> tuple[
+    dict[str, Any] | None,
+    bytes | None,
+    str | None,
+    str | None,
+    dict[str, str],
+]:
+    raw, response_status, response_request_id, cf_ray, headers = post_request(
+        endpoint,
+        body,
+        content_type,
+        api_key,
+        timeout,
+        idempotency_key=idempotency_key,
+    )
+    if response_status != 202:
+        try:
+            direct_payload = parse_api_payload(raw, api_key, response_request_id)
+        except UserError as exc:
+            raise CompletedRequestError(
+                f"{exc}；异步提交实际返回 HTTP {response_status}，请求可能已执行",
+                response_request_id,
+                cf_ray=cf_ray,
+                idempotency_key=idempotency_key,
+                resubmit_safe_with_same_idempotency_key=False,
+            ) from exc
+        if isinstance(direct_payload.get("data"), list) or isinstance(
+            direct_payload.get("b64_json"), str
+        ):
+            return None, raw, response_request_id, cf_ray, headers
+        raise CompletedRequestError(
+            f"异步提交预期 HTTP 202，实际为 HTTP {response_status}；请求可能已执行",
+            response_request_id,
+            cf_ray=cf_ray,
+            idempotency_key=idempotency_key,
+            resubmit_safe_with_same_idempotency_key=False,
+        )
+    task_id: str | None = None
+    try:
+        payload = parse_json_object(
+            raw,
+            api_key,
+            response_request_id,
+            label="异步提交接口",
+        )
+        task_id = validate_async_task_payload(payload)
+    except UserError as exc:
+        raise CompletedRequestError(
+            f"{exc}；请求已收到 HTTP 2xx，任务是否入队未知",
+            response_request_id,
+            cf_ray=cf_ray,
+            task_id=task_id,
+            idempotency_key=idempotency_key,
+            resubmit_safe_with_same_idempotency_key=True,
+        ) from exc
+    return payload, None, response_request_id, cf_ray, headers
+
+
+def async_task_failure(
+    payload: dict[str, Any],
+    task_id: str,
+    idempotency_key: str,
+) -> RequestError:
+    status = str(payload.get("status") or "").strip().lower()
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    code = str(error.get("code") or f"image_task_{status}")
+    message = str(error.get("message") or "图片异步任务未成功完成")
+    request_id_value = task_request_id(payload)
+    if status == "unknown":
+        message = f"图片任务状态未知（{code}）：{message}；请勿创建新任务"
+    else:
+        message = f"图片任务失败（{code}）：{message}"
+    return RequestError(
+        message,
+        request_id=request_id_value,
+        task_id=task_id,
+        idempotency_key=idempotency_key,
+        billing_state="unknown" if status == "unknown" else "relay_reported_failed",
+        resubmit_safe_with_same_idempotency_key=True,
+        poll_safe=False,
+    )
+
+
+def wait_for_async_result(
+    base_url: str,
+    initial_payload: dict[str, Any],
+    initial_headers: dict[str, str],
+    api_key: str,
+    timeout: float,
+    wait_timeout: float,
+    default_poll_interval: float,
+    idempotency_key: str,
+) -> tuple[bytes, str | None]:
+    task_id = validate_async_task_payload(initial_payload)
+    status_endpoint = f"{base_url}/images/tasks/{task_id}"
+    result_endpoint = f"{status_endpoint}/result"
+    payload = initial_payload
+    headers = initial_headers
+    deadline = time.monotonic() + wait_timeout
+
+    while True:
+        status = str(payload.get("status") or "").strip().lower()
+        request_id_value = task_request_id(payload)
+        if payload.get("expired"):
+            raise RequestError(
+                "图片异步任务结果已过期",
+                request_id=request_id_value,
+                task_id=task_id,
+                idempotency_key=idempotency_key,
+                billing_state="unknown",
+            )
+        if status == "succeeded":
+            try:
+                raw, _, _, _, _ = get_request(
+                    result_endpoint,
+                    api_key,
+                    timeout,
+                    task_id,
+                )
+                return raw, request_id_value
+            except RequestError as exc:
+                if not exc.poll_safe:
+                    raise
+        elif status in {"failed", "unknown"}:
+            raise async_task_failure(payload, task_id, idempotency_key)
+        elif status not in {"queued", "in_progress"}:
+            raise RequestError(
+                f"图片异步任务返回未知状态：{status or '<empty>'}",
+                request_id=request_id_value,
+                task_id=task_id,
+                idempotency_key=idempotency_key,
+                billing_state="unknown",
+                resubmit_safe_with_same_idempotency_key=True,
+                poll_safe=True,
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RequestError(
+                f"等待异步任务超过 {wait_timeout:g} 秒；任务仍可查询，请勿创建新任务",
+                request_id=request_id_value,
+                task_id=task_id,
+                idempotency_key=idempotency_key,
+                billing_state="unknown",
+                resubmit_safe_with_same_idempotency_key=True,
+                poll_safe=True,
+            )
+        time.sleep(min(poll_delay(headers, default_poll_interval), remaining))
+        try:
+            raw, _, _, _, headers = get_request(
+                status_endpoint,
+                api_key,
+                timeout,
+                task_id,
+            )
+            payload = parse_json_object(raw, api_key, request_id_value, label="任务查询接口")
+            returned_task_id = validate_async_task_payload(payload)
+            if returned_task_id != task_id:
+                raise UserError("任务查询接口返回了不同的任务 ID")
+        except RequestError as exc:
+            if not exc.poll_safe:
+                raise
+            headers = {}
+        except UserError as exc:
+            raise RequestError(
+                str(exc),
+                request_id=request_id_value,
+                task_id=task_id,
+                idempotency_key=idempotency_key,
+                billing_state="unknown",
+                resubmit_safe_with_same_idempotency_key=True,
+                poll_safe=True,
+            ) from exc
 
 
 def decode_base64(value: str) -> bytes:
@@ -887,9 +1317,13 @@ def main() -> int:
     saved: list[str] = []
     image_records: list[dict[str, Any]] = []
     request_ids: list[str] = []
+    cf_rays: list[str] = []
+    task_ids: list[str] = []
     warnings: list[str] = []
     completed_http_requests = 0
     current_output: str | None = None
+    current_task_id: str | None = None
+    current_idempotency_key: str | None = None
     try:
         base_url, size = validate_args(args)
         paths = output_paths(args.output, args.count, args.output_format, args.overwrite)
@@ -903,8 +1337,23 @@ def main() -> int:
                     {
                         "dry_run": True,
                         "mode": mode,
+                        "request_mode": args.request_mode,
                         "endpoint": endpoint,
                         "fields": fields,
+                        "async": (
+                            {
+                                "prefer": "respond-async",
+                                "idempotency_key": (
+                                    "<provided>"
+                                    if args.idempotency_key
+                                    else "<generated-per-request>"
+                                ),
+                                "wait_timeout": args.wait_timeout,
+                                "poll_interval": args.poll_interval,
+                            }
+                            if args.request_mode == "async"
+                            else None
+                        ),
                         "image": str(args.image.resolve()) if args.image else None,
                         "mask": str(args.mask.resolve()) if args.mask else None,
                         "outputs": [str(path) for path in paths],
@@ -924,17 +1373,72 @@ def main() -> int:
 
         for index, path in enumerate(paths):
             current_output = str(path)
+            current_task_id = None
+            current_idempotency_key = None
             if args.image:
                 body, content_type = build_multipart(fields, args.image, args.mask)
             else:
                 body = json.dumps(fields, ensure_ascii=False).encode("utf-8")
                 content_type = "application/json"
-            raw, response_request_id = post_request(
-                endpoint, body, content_type, api_key, args.timeout
-            )
-            completed_http_requests += 1
-            if response_request_id:
-                request_ids.append(response_request_id)
+            if args.request_mode == "async":
+                current_idempotency_key = (
+                    args.idempotency_key or f"worldcodes-image-{uuid4().hex}"
+                )
+                (
+                    task_payload,
+                    direct_result,
+                    response_request_id,
+                    cf_ray,
+                    response_headers,
+                ) = submit_async_request(
+                    endpoint,
+                    body,
+                    content_type,
+                    api_key,
+                    args.timeout,
+                    current_idempotency_key,
+                )
+                completed_http_requests += 1
+                if cf_ray and cf_ray not in cf_rays:
+                    cf_rays.append(cf_ray)
+                if response_request_id and response_request_id not in request_ids:
+                    request_ids.append(response_request_id)
+                if direct_result is not None:
+                    raw = direct_result
+                    warnings.append(
+                        "Relay 未返回异步任务而直接返回图片；已按同步结果处理"
+                    )
+                else:
+                    if task_payload is None:
+                        raise UserError("异步提交未返回任务或图片结果")
+                    current_task_id = validate_async_task_payload(task_payload)
+                    if current_task_id not in task_ids:
+                        task_ids.append(current_task_id)
+                    payload_request_id = task_request_id(task_payload)
+                    if payload_request_id and payload_request_id not in request_ids:
+                        request_ids.append(payload_request_id)
+                    raw, payload_request_id = wait_for_async_result(
+                        base_url,
+                        task_payload,
+                        response_headers,
+                        api_key,
+                        args.timeout,
+                        args.wait_timeout,
+                        args.poll_interval,
+                        current_idempotency_key,
+                    )
+                    if payload_request_id and payload_request_id not in request_ids:
+                        request_ids.append(payload_request_id)
+                    response_request_id = payload_request_id or response_request_id
+            else:
+                raw, _, response_request_id, cf_ray, _ = post_request(
+                    endpoint, body, content_type, api_key, args.timeout
+                )
+                completed_http_requests += 1
+                if response_request_id and response_request_id not in request_ids:
+                    request_ids.append(response_request_id)
+                if cf_ray and cf_ray not in cf_rays:
+                    cf_rays.append(cf_ray)
             payload = parse_api_payload(raw, api_key, response_request_id)
             images = extract_images(payload, args.timeout)
             if len(images) != 1:
@@ -956,23 +1460,26 @@ def main() -> int:
                         f"与请求的 {size} 不一致"
                     )
             current_output = None
+            current_task_id = None
+            current_idempotency_key = None
 
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "mode": mode,
-                    "model": args.model,
-                    "size": size,
-                    "quality": args.quality,
-                    "files": saved,
-                    "images": image_records,
-                    "request_ids": request_ids,
-                    "warnings": warnings,
-                },
-                ensure_ascii=False,
-            )
-        )
+        result: dict[str, Any] = {
+            "ok": True,
+            "mode": mode,
+            "request_mode": args.request_mode,
+            "model": args.model,
+            "size": size,
+            "quality": args.quality,
+            "files": saved,
+            "images": image_records,
+            "request_ids": request_ids,
+            "warnings": warnings,
+        }
+        if task_ids:
+            result["task_ids"] = task_ids
+        if cf_rays:
+            result["cf_rays"] = cf_rays
+        print(json.dumps(result, ensure_ascii=False))
         return 0
     except (UserError, OSError) as exc:
         if isinstance(exc, CompletedRequestError):
@@ -982,12 +1489,55 @@ def main() -> int:
                 and exc.response_request_id not in request_ids
             ):
                 request_ids.append(exc.response_request_id)
-        error: dict[str, Any] = {"ok": False, "error": str(exc)}
+        if isinstance(exc, RequestError):
+            if exc.request_id and exc.request_id not in request_ids:
+                request_ids.append(exc.request_id)
+            if exc.cf_ray and exc.cf_ray not in cf_rays:
+                cf_rays.append(exc.cf_ray)
+            if exc.task_id:
+                current_task_id = exc.task_id
+                if exc.task_id not in task_ids:
+                    task_ids.append(exc.task_id)
+            if exc.idempotency_key:
+                current_idempotency_key = exc.idempotency_key
+        error: dict[str, Any] = {
+            "ok": False,
+            "request_mode": getattr(args, "request_mode", None),
+            "error": str(exc),
+        }
         if completed_http_requests:
             error["completed_http_requests"] = completed_http_requests
-            error["billing_warning"] = "已有请求收到 HTTP 2xx，可能已计费；请勿盲目重试"
+            error["billing_warning"] = (
+                "已有异步任务被接收；请查询或恢复原任务，不要换 Key 创建新任务"
+                if getattr(args, "request_mode", None) == "async"
+                and (task_ids or current_task_id)
+                else "已有请求收到 HTTP 2xx，可能已计费；请勿盲目重试"
+            )
+        if isinstance(exc, RequestError):
+            if exc.http_status is not None:
+                error["http_status"] = exc.http_status
+            error["billing_state"] = exc.billing_state
+            error["resubmit_safe_with_same_idempotency_key"] = (
+                exc.resubmit_safe_with_same_idempotency_key
+            )
+            error["poll_safe"] = exc.poll_safe
         if request_ids:
             error["request_ids"] = request_ids
+        if cf_rays:
+            error["cf_rays"] = cf_rays
+        if task_ids:
+            error["task_ids"] = task_ids
+        if current_task_id:
+            error["task_id"] = current_task_id
+        if current_idempotency_key:
+            error["idempotency_key"] = current_idempotency_key
+        if isinstance(exc, RequestError):
+            if exc.resubmit_safe_with_same_idempotency_key:
+                error["retry_guidance"] = (
+                    "仅用完全相同的参数和同一 Idempotency-Key 重提；不要更换 Key"
+                )
+            elif exc.poll_safe and current_task_id:
+                error["retry_guidance"] = "仅继续查询 task_id；不要重新提交生图请求"
         if saved:
             error["files"] = saved
         if current_output:
